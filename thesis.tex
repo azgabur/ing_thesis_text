@@ -44,12 +44,12 @@
     faculty     = fi,
     type        = mgr,
     department  = Department of Computer Systems and Communications,
-    author      = Alexander Zgabur,
+    author      = Bc. Alexander Zgabur,
     gender      = m,
     advisor     = {RNDr. Adam Rambousek, Ph.D.},
     title       = {Generation and Automation of a Testing Matrix for Kuadrant project},
     TeXtitle    = {Generation and Automation of a Testing Matrix for Kuadrant project},
-    keywords    = {Tekton, CI/CD Kubernetes},
+    keywords    = {Tekton, CI/CD, Kubernetes},
     TeXkeywords = {Tekton, CI/CD, Kubernetes},
     abstract    = {%
         Todo
@@ -107,10 +107,10 @@
 \chapter{Background and goal}
 \label{ch:first}
 Intro to chapter
-\section{Automated matrix testing}
-What it is, and the benefits
 \section{Kuadrant project}
 What is Kuadrant
+\section{Automated matrix testing}
+What it is, and the benefits
 \subsection{Kuadrant supported matrix}
 The matrix
 
@@ -118,9 +118,12 @@ The matrix
 Intro to chapter.
 \section{Pairwise combination theory}
 What is pairwise, why is it a fit to Kuadrant.
-\section{Analysis of existing solution (jurban work)}
 
 \chapter{Improvements to generator}
+\section{Analysis of existing solution (jurban work)}
+What is and what is missing
+\section{}
+TODO start
 1. Weights do not work. Prioritization of specific configuration should be improved.
 2. Mandatory pairs, Exluded pairs, max occurances of confuguration as opposed to weights
 3. json input -> yaml input
@@ -128,6 +131,9 @@ What is pairwise, why is it a fit to Kuadrant.
 5. Architecture support
 6. Dockerize
 7. Tests + github actions
+TODO end
+\section{Refactoring tests}
+TODO Previous tests ran in  2.68s and had one failing test due to updated Click dependancy. I refactored the tests and they run in 0.04s.
 
 \chapter{Test automation}
 Into into chapter
@@ -145,6 +151,9 @@ GUI
 \chapter*{Conclusion}
 \addcontentsline{toc}{chapter}{Conclusion}
 Lorem ipsum
+
+kniga:
+ISTQB® Certified Tester Foundation Level: A Self-Study Guide Syllabus v4.0
 
 
 \appendix
