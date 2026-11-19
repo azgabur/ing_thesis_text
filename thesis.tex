@@ -117,7 +117,29 @@ The matrix
 \chapter{Pairwise testing}
 Intro to chapter.
 \section{Pairwise combination theory}
+\label{sec:pairwise-theory}
 What is pairwise, why is it a fit to Kuadrant.
+
+Formally, let a specification consist of parameter kinds $K_1,\dots,K_n$ with finite
+value domains $D(K_1),\dots,D(K_n)$. Define the set of \emph{required pairs} as
+%
+\begin{equation}
+  \label{eq:required-pairs}
+  P \;=\; \bigl\{\, \{u,v\} \;\bigm|\;
+      1 \le i < j \le n,\;
+      u \in D(K_i),\;
+      v \in D(K_j) \,\bigr\},
+\end{equation}
+%
+that is, every unordered pair of values drawn from two \emph{distinct} kinds. A
+generated family of configurations $\mathcal{C}$ is correct if and only if every
+required pair occurs together in at least one configuration:
+%
+\begin{equation}
+  \label{eq:coverage}
+  \forall\, p \in P \;\;
+  \exists\, c \in \mathcal{C} \;:\; p \subseteq c .
+\end{equation}
 
 \chapter{Improvements to generator}
 \section{Analysis of existing solution (jurban work)}
@@ -133,7 +155,401 @@ TODO start
 7. Tests + github actions
 TODO end
 \section{Refactoring tests}
-TODO Previous tests ran in  2.68s and had one failing test due to updated Click dependancy. I refactored the tests and they run in 0.04s.
+\label{sec:test-suite-improvements}
+The \emph{Pairwise} tool generates a set of test configurations from a
+specification of parameter \emph{kinds}, each associated with a finite domain of
+values, optionally weighted to bias the relative frequency of individual values.
+Its purpose is combinatorial: rather than enumerating the full Cartesian product
+of all parameter domains---which grows multiplicatively and quickly becomes
+intractable---the tool emits a far smaller family of configurations that still
+satisfies the \emph{pairwise} (or \emph{all-pairs}) coverage criterion. This
+criterion, stated formally as Property~\eqref{eq:coverage} in
+Section~\ref{sec:pairwise-theory}, is the formal contract of the program.
+
+Because the correctness of such a generator is a precisely expressible
+mathematical property, the quality of its test suite is best measured not by how
+faithfully the tests reproduce a particular output, but by how directly they
+assert Property~\eqref{eq:coverage}. The work described in this section
+progressively reshaped the suite toward that goal, while also modernising the
+mechanics by which the \gls{CLI} is exercised. The remainder of the
+section documents five changes: (i)~a safer temporary-file fixture;
+(ii)~a transition from subprocess invocation to in-process invocation of the
+command; (iii)~the correction of an assertion that had drifted out of step with
+an upstream library; (iv)~the central contribution, a set of property-based
+coverage tests together with structural validation of the \gls{CSV} export; and
+(v)~an extension of those properties to weighted generation and to edge-case
+inputs, one of which exposed a defect in the generator.
+
+\subsection{A Safer Temporary-File Fixture}
+\label{sec:tsi-tempfile}
+
+Several tests require an input file containing a \gls{JSON} specification. The original
+fixture synthesised a file name from ten random lowercase letters, created the
+file in the \emph{current working directory}, and registered a finaliser to
+delete it afterwards. This arrangement has three weaknesses. First, it is not
+hermetic: the file is written into the directory from which the tests happen to
+be launched, polluting the working tree and coupling the test to an assumption
+about that directory's writability. Second, the construction of a unique name is
+delegated to a random-string heuristic, which carries a non-zero probability of
+collision and duplicates functionality the standard library already provides
+atomically. Third, a crash between name selection and file creation could leave
+the finaliser attempting to remove a file that was never created, or---worse---a
+pre-existing file of the same name could be silently overwritten.
+
+The fixture was rewritten to use \texttt{tempfile.mkstemp}, which atomically
+creates a uniquely named file in the platform's temporary directory and returns
+an open file descriptor together with the absolute path. The descriptor is
+wrapped with \texttt{os.fdopen} so that the \gls{JSON} payload is written through the
+same handle that \texttt{mkstemp} opened, avoiding a redundant re-open and the
+attendant time-of-check-to-time-of-use window. Cleanup remains attached to the
+test via the existing finaliser mechanism. The change improves isolation,
+eliminates the collision heuristic, and removes the dependency on the working
+directory being writable, at no cost to the fixture's interface.
+
+\subsection{From Subprocess Invocation to In-Process Invocation}
+\label{sec:tsi-clirunner}
+
+In their original form, the tests exercised the program by shelling out through
+the operating system, for example
+\texttt{os.system("pipenv run pairwise \textit{file}")}, and then inspecting the
+captured standard output and standard error via the \texttt{capfd} fixture. This
+design, although superficially faithful to how an end user invokes the tool, has
+substantial methodological drawbacks.
+
+\paragraph{Cost.} Each test spawned a chain of processes: a shell, the
+\texttt{pipenv} resolver, and finally a fresh Python interpreter that imported
+the application from scratch. The per-test latency was dominated by process
+creation and interpreter start-up rather than by the computation under test. In total, the
+original suite took $2.68$~s to run.
+
+\paragraph{Observability of coverage.} Code executed in a separate interpreter
+is invisible to a coverage instrument running in the test process. Consequently,
+the subprocess-based suite could report nothing about which lines of the
+generator it actually exercised, depriving the author of the single most useful
+signal for judging test adequacy.
+
+\paragraph{Fragility.} Scraping human-readable diagnostics from a subprocess's
+standard error couples the assertions to incidental output. Indeed, the
+\texttt{pipenv} front-end emits a ``courtesy notice'' onto standard error, which
+interleaves with the program's own diagnostics and complicates exact-match
+assertions.
+
+The suite was therefore migrated to Click's \texttt{CliRunner}, the testing
+harness shipped with the command-line framework the tool is built upon.
+\texttt{CliRunner.invoke} executes the command \emph{in the same interpreter},
+returning a result object that exposes the standard-output text, the
+standard-error text, the process exit code, and---crucially---any exception that
+propagated out of the command. A single shared \texttt{runner} fixture was added
+to the test configuration, and each call site was rewritten from a shell string
+to a structured argument list, for example
+\texttt{runner.invoke(main, ["--output", path, file])}.
+
+Invoking the command in-process changes \emph{where} certain observable effects
+surface, and the migration had to account for this explicitly:
+
+\begin{itemize}
+  \item \textbf{Framework usage errors} (an unknown option, a malformed numeric
+        argument, a missing or non-existent file argument) are produced by Click
+        itself and continue to appear on standard error, now read from
+        \texttt{result.stderr} with the process exit code available for
+        corroboration.
+  \item \textbf{Application-level validation errors} are raised as ordinary
+        Python exceptions by the specification checker. Under a subprocess these
+        surfaced as a traceback on standard error; under \texttt{CliRunner} they
+        are instead \emph{captured} and exposed through
+        \texttt{result.exception}. The affected assertions were adjusted to
+        consult both the standard-error text and the captured exception, so that
+        a single parametrised test can accommodate both the framework-produced
+        and application-produced diagnostics.
+  \item \textbf{Warnings} emitted via \texttt{warnings.warn}---for instance when
+        the requested weighting cannot be satisfied by any further unique
+        configuration---are, under the test runner, intercepted by the testing
+        framework's warnings machinery rather than written verbatim to standard
+        error. The corresponding test was rewritten to assert the warning
+        directly with \texttt{pytest.warns(UserWarning, match=\ldots)}, which is
+        both more precise and more robust than substring-matching a stream.
+\end{itemize}
+
+An unavoidable consequence of in-process invocation is that the tests no longer
+traverse the packaging entry point (the \texttt{pipenv} script declaration and
+the module's \texttt{\_\_main\_\_} guard). This limitation is revisited in
+Section~\ref{sec:tsi-validity}.
+
+\subsection{Correcting a Stale Assertion}
+\label{sec:tsi-stale}
+
+One pre-existing test asserted that supplying an unknown option yields the
+diagnostic \texttt{"No such option: -{}-invalid"}. This assertion failed, not
+because the program misbehaved, but because the underlying command-line
+framework had, in a later release, reworded the message to
+\texttt{"No such option '-{}-invalid'."}---altering the punctuation and quoting
+while preserving the meaning. The episode is a textbook illustration of the
+distinction between a defect in the \emph{system under test} and a defect in the
+\emph{test oracle}: the behaviour was correct, but the expectation had grown
+stale against an evolving dependency. The fix updated the expected string to the
+current wording. It is worth noting that assertions of this kind---verbatim
+matches against a third party's human-readable text---are intrinsically brittle,
+a weakness that the property-based approach of the next subsection is designed to
+avoid wherever the contract permits.
+
+\subsection{Property-Based Coverage Testing}
+\label{sec:tsi-property}
+
+The central contribution of this work is to test the generator against its
+\emph{specification}---Property~\eqref{eq:coverage}---rather than against a
+single memorised output. The original \texttt{test\_pairwise.py} contained two
+tests, both of which ran the smallest possible input (three kinds of two values
+each) and asserted an exact, hard-coded output string. Such \emph{golden-output}
+tests have two complementary failure modes. They are simultaneously too strict,
+in that any change to the ordering or formatting of the output breaks them even
+when the result remains correct; and too weak, in that they say nothing whatever
+about inputs other than the single case they encode. Measured line coverage of
+the generator module attributable to this file alone was only $66\%$; the
+uncovered remainder was concentrated precisely in the routines that construct
+configurations from triplets and from the weight-aware fallback search---code
+paths that are reached only for larger or asymmetric inputs the test never
+supplied.
+
+To test the property directly, three small, pure helper functions were
+introduced. The first, \texttt{parse\_configurations}, reconstructs the list of
+configurations from the program's standard output. Each printed line has the
+form \texttt{N: [\,\ldots\,]}, where the bracketed remainder is a Python list
+literal; it is recovered with \texttt{ast.literal\_eval} rather than the unsafe
+\texttt{eval}, a choice that also guarantees the mixed string and integer values
+round-trip to their original types. The second, \texttt{expected\_pairs},
+computes the required-pair set $P$ of Equation~\eqref{eq:required-pairs} directly
+from the specification. The third, \texttt{covered\_pairs}, computes the pairs
+actually realised by the generated configurations. The coverage obligation
+\eqref{eq:coverage} is then checked by the set containment
+%
+\begin{equation}
+  \label{eq:assertion}
+  \texttt{expected\_pairs}(\text{spec}) \;\subseteq\;
+  \texttt{covered\_pairs}(\text{configurations}),
+\end{equation}
+%
+with the offending pairs reported in the assertion message when it fails.
+
+Crucially, \texttt{expected\_pairs} is derived independently of the generator's
+internal pair bookkeeping, so the test functions as a genuine \emph{oracle}
+rather than a restatement of the implementation. A representative formulation of
+the test is shown in Listing~\ref{lst:property}.
+
+\begin{lstlisting}[caption={Property-based coverage test (abridged).},label={lst:property},language=Python]
+@pytest.mark.parametrize("parameters", [
+    {"P1": ["a", "b"], "P2": [1, 2], "P3": ["x", "y"]},             # symmetric
+    {"P1": ["a", "b", "c", "d"], "P2": [1, 2], "P3": ["x", "y"]},   # asymmetric
+    {"P1": ["a", "b"], "P2": [1, 2]},                               # two kinds
+    {"P1": ["a", "b"], "P2": [1, 2], "P3": ["x", "y"], "P4": ["m", "n"]},  # four kinds
+])
+def test_pairwise_covers_all_pairs(runner, create_file, parameters):
+    filename = create_file({"Parameters": parameters})
+    result = runner.invoke(main, [filename])
+    assert result.exit_code == 0
+    configurations = parse_configurations(result.output)
+    missing = expected_pairs(parameters) - covered_pairs(configurations)
+    assert not missing, f"uncovered pairs: {missing}"
+\end{lstlisting}
+
+The input specifications supplied to the parametrised test were chosen to probe
+distinct regions of the input space rather than to accumulate volume. The
+\emph{symmetric} case (all kinds of equal arity) establishes the baseline. The
+\emph{asymmetric} case, in which one kind has twice as many values as the others,
+is the smallest input that compels the generator to employ its triplet-packing
+logic, and thus exercises the previously uncovered routines. The
+\emph{two-kind} case tests the lower boundary at which the notion of a cross-kind
+pair is still defined. The \emph{four-kind} case verifies that coverage is
+maintained as the number of kinds---and hence the number of required pairs---
+grows. Three further shapes were subsequently added to the same
+parametrisation (they are omitted from the abridged listing): a case with
+\emph{three values per kind}, in which every kind is larger than the minimum; a
+case in which \emph{all arities differ} (five, three and two values); and a case
+containing a \emph{single-value kind}, the lower boundary of a domain. Each case
+was confirmed to terminate with a success exit code and to satisfy the
+containment~\eqref{eq:assertion}.
+
+The original golden-output test, \texttt{test\_pairwise}, was retained alongside
+the new tests as a \emph{legacy test}. It is kept from the original suite
+unchanged, but is no longer relied upon to establish correctness: that role now
+belongs to the property-based coverage test. Although brittle, it is inexpensive
+and will incidentally flag a change to the output's human-readable format, a
+concern orthogonal to the coverage property.
+
+\subsection{Structural Validation of the CSV Export}
+\label{sec:tsi-csv}
+
+The test for the \texttt{-{}-output} option originally asserted only that the
+destination file \emph{existed}. This is a necessary but grossly insufficient
+condition: the export routine could emit a malformed header, omit rows, or write
+nonsense, and the test would still pass. The test was strengthened to open the
+written file with the standard \texttt{csv} reader and to assert two structural
+invariants: that the header row equals the sequence of parameter-kind names, and
+that the number of data rows equals the number of configurations reported on
+standard output. The export is thereby validated for both its schema and its
+cardinality, elevating the check from mere existence to content conformance. As a
+secondary benefit, the test writes into a per-test temporary directory supplied
+by the framework's \texttt{tmp\_path} fixture, restoring the hermeticity goal of
+Section~\ref{sec:tsi-tempfile} to this case as well.
+
+\subsection{Weighted Generation and Edge Cases}
+\label{sec:tsi-weights}
+
+The property tests of Section~\ref{sec:tsi-property} use only unweighted
+specifications, yet weights are a principal feature of the tool. A weight $w(v)$
+asks the generator to include value $v$ more often relative to the other values
+of its kind; a weight of zero marks $v$ as needed only for pairwise coverage, so
+that it should not be added once its pairs are covered. Weights may therefore
+cause additional configurations to be emitted, but they must never weaken
+Property~\eqref{eq:coverage}. The unweighted tests were kept unchanged in
+\texttt{test\_pairwise.py}, which is reserved for unweighted generation. The
+three weighted tests described below were added to \texttt{test\_weights.py},
+alongside the existing weight tests, and the single-kind test to
+\texttt{test\_pairwise.py}. To share the oracle between the two files, the
+helper functions of Section~\ref{sec:tsi-property} were moved into a common
+module, \texttt{tests/helpers.py}.
+
+\paragraph{Coverage under weights.} The test
+\texttt{test\_weighted\_pairwise\_covers\_all\_pairs} applies the containment
+check~\eqref{eq:assertion} to weighted specifications: a weight of two on one
+value, a weight of zero on one value, and both together on an asymmetric input
+of four kinds (four, four, two and two values).
+
+\paragraph{Coverage when weights cannot be met.} When no further unique
+configuration can bring the frequencies closer to the weights, the tool stops and
+issues a warning. The test
+\texttt{test\_exhausted\_weights\_still\_cover\_all\_pairs} combines an
+unattainable weight with a zero weight, asserts that the warning is raised, and
+asserts that every required pair is nevertheless covered. Stopping early thus
+affects only the frequencies, never the coverage obligation.
+
+\paragraph{Frequencies within the margin.} The existing weight test asserted
+hard-coded usage counts, which, like golden output, are brittle and specific to a
+single input. The new test \texttt{test\_weights\_within\_margin} instead checks
+the guarantee that the \texttt{-{}-margin} option expresses. For each value $v$
+of kind $K$, let $q(v)$ be the share of configurations in which $v$ occupies
+kind $K$, and let $r(v) = w(v) / \sum_{u \in D(K)} w(u)$ be the share its weight
+requests, where an unweighted value counts as $w = 1$. The test asserts
+%
+\begin{equation}
+  \label{eq:margin}
+  \Bigl|\, q(v) \ln \frac{q(v)}{r(v)} \,\Bigr| \;\le\; m
+  \qquad \text{for every value } v,
+\end{equation}
+%
+where $m$ is the margin, for $m \in \{0.05, 0.2\}$ on two weighted
+specifications. As with \texttt{expected\_pairs}, the divergence is computed
+from the emitted configurations alone, independently of the generator's
+internal bookkeeping. Zero weights are excluded from this test because the
+generator does not use them as frequency targets.
+
+\paragraph{A defect exposed by a single-kind input.} A specification with only
+one kind, such as \texttt{\{"P1": ["a", "b"]\}}, has no required pairs. The
+generator then selects the first configuration's starting value from usage
+counts that are still empty, and fails with a \texttt{KeyError}. The test
+\texttt{test\_single\_kind} records the expected behaviour, one configuration per
+value, and is marked as a strict expected failure. It therefore fails loudly
+once the defect is repaired, prompting removal of the marker. Whether such
+input should instead be rejected during parameter validation is left as a
+design decision.
+
+\subsection{Results}
+\label{sec:tsi-results}
+
+The effect of the changes on statement coverage of the generator module is
+summarised in Table~\ref{tab:coverage}. Considered in isolation,
+\texttt{test\_pairwise.py} rose from $66\%$ to $79\%$ with the property tests of
+Section~\ref{sec:tsi-property}, the increase being attributable to the
+triplet-construction paths now reached by the asymmetric and higher-arity
+inputs. The three additional unweighted input shapes, described at the end of
+Section~\ref{sec:tsi-property}, raised it to $80\%$. The weight-aware selection and fallback routines that
+account for most of the remainder are exercised by \texttt{test\_weights.py},
+which on its own covers $95\%$ of the module both before and after the weighted
+tests were added to it. When the entire suite is measured together---the
+property tests complementing the weight-oriented and argument-parsing tests---
+coverage of the generator module is $97\%$ (311 of 321 statements), again both
+before and after the additions of Section~\ref{sec:tsi-weights}. The weighted
+tests reach no new statements, because the existing weight tests already
+executed the same routines; their value lies in the properties they assert, not
+in the statements they execute. The full suite comprises twenty-seven passing tests and one expected
+failure, and runs in about $0.1$~s. The original subprocess-based suite took
+$2.68$~s, and the migrated suite took $0.04$~s before the tests of
+Section~\ref{sec:tsi-weights} were added. The speed-up is a direct consequence
+of the move to in-process invocation described in Section~\ref{sec:tsi-clirunner}.
+
+\begin{table}[h]
+  \centering
+  \begin{tabular}{lccc}
+    \hline
+    Measurement scope & Original & Property tests & Weighted and edge cases \\
+    \hline
+    \texttt{test\_pairwise.py} only & $66\%$ & $79\%$ & $80\%$ \\
+    \texttt{test\_weights.py} only  & ---    & $95\%$ & $95\%$ \\
+    Whole suite                     & ---    & $97\%$ & $97\%$ \\
+    \hline
+  \end{tabular}
+  \caption{Statement coverage of the generator module after each stage of the
+    changes. The ``original'' figures for \texttt{test\_weights.py} and the
+    whole suite are omitted because the
+    original subprocess-based suite was not measurable by an in-process coverage
+    instrument---itself an argument for the migration.}
+  \label{tab:coverage}
+\end{table}
+
+The ten statements the whole suite does not execute fall into three groups.
+Five cannot be executed by any input. In the routine that attempts to add an
+arbitrary triplet, the generator repeats a call that has just failed with
+identical arguments and an unchanged configuration, so the call never succeeds;
+this makes both its success branch and the corresponding branch in the caller
+unreachable. In addition, the fallback after the loop that selects the starting
+value of a configuration, which also contains a leftover debugging
+\texttt{print}, cannot be reached because the loop always returns. These five
+statements are better removed than tested; their removal would raise suite
+coverage to roughly $98\%$. One further statement, the result returned when the
+kind of an unknown value is looked up, can be reached only by calling an
+internal method directly, which would test implementation detail rather than
+behaviour. The remaining four, which skip a zero-weight value whose pairs are
+already covered and reject a triplet that conflicts with a partly built
+configuration, are not reached by any of the chosen specifications.
+
+\subsection{Threats to Validity and Limitations}
+\label{sec:tsi-validity}
+
+Three limitations qualify the preceding results. First, as noted in
+Section~\ref{sec:tsi-clirunner}, in-process invocation does not traverse the
+packaging entry point; a broken script declaration or module guard would escape
+the suite. A single end-to-end smoke test retaining the subprocess invocation
+would close this gap at modest cost and is recommended as future work. Second,
+the property tests presuppose that the generator is deterministic, so that a
+single invocation per specification is representative; this holds for the current
+implementation, which employs no randomness, but would need revisiting should a
+randomised or seeded variant be introduced. Third, the coverage property is
+verified only on a finite, hand-chosen selection of input shapes. While these
+were selected to exercise qualitatively distinct code paths, they do not
+constitute an exhaustive exploration of the input space, as the four reachable
+but unexecuted statements of Section~\ref{sec:tsi-results} illustrate; a generative,
+property-testing framework that samples specifications at random would provide
+stronger assurance and is a natural extension of the oracle-based approach
+established here.
+
+\subsection{Summary}
+\label{sec:tsi-conclusion}
+
+The test suite was transformed from a collection of brittle, subprocess-driven,
+golden-output checks into a faster, observable, and specification-oriented suite.
+The temporary-file fixture was made hermetic; invocation was moved in-process,
+restoring coverage observability and eliminating process-spawn overhead while
+carefully preserving the semantics of errors and warnings; a stale assertion was
+reconciled with its evolved dependency; and, most importantly, the generator is
+now tested against the formal pairwise-coverage property of
+Equation~\eqref{eq:coverage} across deliberately varied inputs, with and without
+weights, with the frequencies checked against the requested margin, and with the
+\gls{CSV} export validated for structural conformance. The edge-case inputs exposed a
+defect in the handling of single-kind specifications, now recorded as an
+expected failure. Statement coverage of the generator module reached $97\%$ for
+the complete suite, and, more
+significantly than any
+single figure, the suite now asserts \emph{what the program is meant to compute}
+rather than \emph{what it happened to print}.
 
 \chapter{Test automation}
 Into into chapter
