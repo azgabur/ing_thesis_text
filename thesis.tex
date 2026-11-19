@@ -670,7 +670,140 @@ significantly than any
 single figure, the suite now asserts \emph{what the program is meant to compute}
 rather than \emph{what it happened to print}.
 
+\section{Container image}
+\label{sec:container-image}
+
+\subsection{Motivation}
+\label{sec:container-motivation}
+Before this work, the generator could only be used from a local copy of its
+repository. The user had to install \texttt{pipenv}, install the dependencies
+into a virtual environment and start the tool with \texttt{pipenv run pairwise}.
+The tool also had to be started from the root of the repository, because
+\texttt{main/main.py} imports the modules \texttt{pairwise} and
+\texttt{parameters\_check} as top-level modules located next to it. Such a
+workflow is acceptable for development, but it is unsuitable for automation. The pipeline
+described in Chapter~\ref{ch:test-automation} runs every step in a container, so
+the generator has to be available as a container image that a pipeline step can
+reference by name. Packaging the tool as an image also fixes the Python
+interpreter and the dependency versions, which ensures that a matrix generated in the
+pipeline and one generated on a developer's workstation originate from an
+identical environment.
+
+\subsection{Choice of base image}
+\label{sec:container-base-image}
+The image is meant to run on Kubernetes and OpenShift clusters that run the
+Kuadrant test suite, and it is published on Quay.io~\cite{quay}, so a base image
+hosted on Quay.io was preferred. Red Hat's \gls{UBI}~\cite{ubi} would constitute the
+natural choice for a Red Hat project: it can be freely redistributed, follows the
+Red Hat Enterprise Linux life cycle and has variants with a preinstalled Python
+interpreter. However, \gls{UBI} images are distributed only from Red Hat's own
+registry (\texttt{registry.access.redhat.com}) and are not published on
+Quay.io.
+
+The image \texttt{quay.io/sclorg/python-312-minimal-c9s} was chosen instead. The
+Software Collections (sclorg) project maintains the recipes for Red Hat's Python
+container images~\cite{sclorg-python}. The same recipe produces both the \gls{UBI}
+image \texttt{ubi9/python-312-minimal} and this CentOS Stream~9 image, which is
+published on Quay.io. The two images therefore have the same layout, the same
+non-root user and the same preactivated virtual environment in
+\texttt{/opt/app-root}, and the image can be switched to its \gls{UBI}
+counterpart by changing only the \texttt{FROM} line. The selection is further
+supported by the following properties:
+%
+\begin{itemize}
+  \item it provides Python~3.12, the same version that the existing \gls{CI}
+        workflow uses to run the linters and the test suite, so the published
+        tool runs on the interpreter it was tested with;
+  \item the \emph{minimal} variant leaves out compilers and development
+        headers, which the tool does not need. That makes the image smaller and
+        reduces the number of packages that can contain vulnerabilities;
+  \item it runs as the unprivileged user with \gls{UID}~1001 and group~0, the
+        convention that OpenShift expects from containers running under its
+        default security context constraints;
+  \item it is published for the \texttt{amd64}, \texttt{arm64} and
+        \texttt{ppc64le} architectures, which permits multi-architecture builds to be
+        introduced in the future.
+\end{itemize}
+%
+Red Hat's minimal hardened images on \texttt{quay.io/hummingbird} were also
+considered, but at the time of writing their Python image shipped Python~3.15,
+which differs from the version used in \gls{CI}.
+
+\subsection{Containerfile}
+\label{sec:containerfile}
+The image is described by the \texttt{Containerfile} in the root of the
+repository, shown in Listing~\ref{lst:containerfile}. The file follows the
+\gls{OCI} image format and works with both Podman/Buildah and Docker.
+%
+\begin{lstlisting}[caption={Containerfile of the generator.},label={lst:containerfile}]
+FROM quay.io/sclorg/python-312-minimal-c9s:latest
+
+LABEL name="pairwise" \
+      summary="Pairwise test configuration generator" \
+      org.opencontainers.image.source="https://github.com/azgabur/Pairwise"
+
+RUN pip install --no-cache-dir click
+
+COPY main/ /opt/app-root/src/main/
+
+ENTRYPOINT ["python3", "/opt/app-root/src/main/main.py"]
+CMD ["--help"]
+\end{lstlisting}
+%
+Only the runtime dependency, \texttt{click}, is installed. The
+\texttt{[packages]} section of the \texttt{Pipfile} also contains
+\texttt{pytest}, but the tool does not need it at run time, so it is left out
+along with the development tools. The \texttt{-{}-no-cache-dir} option keeps the
+downloaded packages out of the image layer. Only the \texttt{main/} directory is
+copied, so the tests, local input files and the Git history do not end up in the
+image. The entrypoint gives the script by its absolute path. Python adds the
+directory of the executed script to the module search path, so the top-level
+imports in \texttt{main.py} work from any working directory and the limitation
+described in Section~\ref{sec:container-motivation} is eliminated. The default
+command \texttt{-{}-help} prints the usage of the tool when the container is
+started without arguments. Any arguments passed to the container replace this
+default and are forwarded directly to the \gls{CLI}; consequently, the image is
+invoked in the same manner as the tool itself:
+%
+\begin{lstlisting}[caption={Running the generator from the container image.},label={lst:container-run}]
+podman run --rm -v "$PWD":/data:Z \
+  quay.io/rhn_support_azgabur/pairwise /data/parameters.json
+\end{lstlisting}
+%
+Because the process inside the container runs as \gls{UID}~1001, writing a
+\gls{CSV} file into a mounted host directory with rootless Podman requires the
+host user to be mapped to that \gls{UID}, for example with
+\texttt{-{}-userns=keep-id:uid=1001,gid=0}. This usage is documented in the
+\texttt{README} of the repository.
+
+\subsection{Automated build and publication}
+\label{sec:container-ci}
+The image is built and published by a new GitHub Actions~\cite{github-actions}
+workflow, \texttt{.github/workflows/image.yml}, which runs alongside the
+existing acceptance workflow. It is triggered by every push to the
+\texttt{master} branch, by pull requests targeting \texttt{master}, and manually
+through \texttt{workflow\_dispatch}. The single job consists of these steps:
+%
+\begin{enumerate}
+  \item the repository is checked out;
+  \item the image is built with the \texttt{redhat-actions/buildah-build}
+        action~\cite{buildah-build-action}, which runs Buildah on the GitHub
+        runner and tags the result as \texttt{pairwise:latest};
+  \item the image is pushed to \texttt{quay.io/rhn\_support\_azgabur/pairwise}
+        under the tag \texttt{latest} with the
+        \texttt{redhat-actions/push-to-registry}
+        action~\cite{push-to-registry-action}.
+\end{enumerate}
+%
+The credentials for Quay.io belong to a Quay robot account. They are
+stored as the repository secrets \texttt{QUAY\_USERNAME} and
+\texttt{QUAY\_PASSWORD} and are never written into the workflow file. Because
+the \texttt{latest} tag always points to the state of the \texttt{master}
+branch, the pipeline in Chapter~\ref{ch:test-automation} can reference the
+image by this tag and thereby always uses the current version of the generator.
+
 \chapter{Test automation}
+\label{ch:test-automation}
 Into into chapter
 \section{CI/CD pipelines in general}
 
