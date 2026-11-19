@@ -120,6 +120,44 @@ Intro to chapter.
 \label{sec:pairwise-theory}
 What is pairwise, why is it a fit to Kuadrant.
 
+The definitions in this section follow the thesis of Urban~\cite{Urban2024thesis},
+whose pairwise generator is the starting point of this work (see
+Section~\ref{sec:existing-solution}). Combinatorial testing is a software
+testing technique that generates and executes test cases by systematically
+considering combinations of input parameters. Its primary aim is to achieve
+thorough test coverage while keeping the number of required test cases
+small~\cite[p.~11]{Urban2024thesis}. Urban illustrates this with three
+parameters $P_1$, $P_2$ and $P_3$ of two values each. Their full combinatorial
+matrix already contains eight configurations, and its size multiplies with every
+further parameter.
+
+The most popular combinatorial technique is $N$-tuple testing, which Urban
+defines as follows~\cite[pp.~18--19]{Urban2024thesis}:
+%
+\begin{quote}
+  \foreignlanguage{slovak}{\enquote{Testovanie N-tic funguje na princípe toho,
+  že každá možná N-tica parametrov je pokrytá aspoň raz. Najpoužívanejšou
+  variantou je práve $N = 2$, kde hovoríme o takzvanom párovom testovaní.}}
+\end{quote}
+%
+That is, $N$-tuple testing requires every possible $N$-tuple of parameters to be
+covered at least once, and its most widely used variant, $N = 2$, is called
+\emph{pairwise testing}. Pairwise testing is considered a reasonable compromise
+between cost and benefit among combinatorial methods. Finding the smallest test
+set that satisfies it is, however, an NP-complete problem, which is why practical
+generators, including the one this work builds upon, rely on greedy
+heuristics~\cite[p.~19]{Urban2024thesis}.
+
+Pairs are formed only between values of different parameters. In Urban's
+example, the parameter group \texttt{Database} contains PSQL and MySQL, so
+neither (PSQL, PSQL) nor (PSQL, MySQL) is a pair that has to be
+covered~\cite[p.~19]{Urban2024thesis}. Urban's implementation chapters, as well
+as the input format of the generator, call such a group a \emph{group of
+parameters} and its members \emph{parameters}. To avoid this double use of the
+word, the rest of this thesis calls a group a parameter \emph{kind} and its
+members \emph{values}. A \emph{configuration} assigns exactly one value to every
+kind.
+
 Formally, let a specification consist of parameter kinds $K_1,\dots,K_n$ with finite
 value domains $D(K_1),\dots,D(K_n)$. Define the set of \emph{required pairs} as
 %
@@ -143,7 +181,84 @@ required pair occurs together in at least one configuration:
 
 \chapter{Improvements to generator}
 \section{Analysis of existing solution (jurban work)}
-What is and what is missing
+\label{sec:existing-solution}
+The generator improved in this work was developed by Urban in his master's
+thesis~\cite{Urban2024thesis}, with the goal of generating a testing matrix for
+releases of the 3scale product. Urban compared the existing combinatorial tools
+PROW, PICT and Focus and the value-weighting method of Fujimoto et al. He then
+implemented his own tool in Python. Its greedy, deterministic, row-by-row
+generation algorithm is inspired by PROW, and its prioritisation of values by
+the Fujimoto method~\cite[pp.~16--22]{Urban2024thesis}.
+
+\paragraph{Interface.} The tool is a \gls{CLI} application built on the
+\texttt{click} library. Its only argument is a \gls{JSON} file with a mandatory
+\texttt{Parameters} object, which maps each kind to the list of its values, and
+an optional \texttt{Weights} object, which maps values to numeric weights.
+The option \texttt{-{}-output} additionally writes the configurations to a
+\gls{CSV} file, and \texttt{-{}-count} prints how many times each value was
+used. The option \texttt{-{}-margin} sets the tolerance with which the tool
+checks that the weights are met: it is the largest \gls{KL} divergence between
+the required and the current ratio of a value that the tool accepts, $0.05$ by
+default~\cite[pp.~23--24]{Urban2024thesis}. The code consists of a
+\texttt{main} function and two classes. \texttt{ParametersCheck} validates the
+input: the \gls{JSON} must be valid, and the input must not contain empty
+kinds, duplicate values, or weights for values that do not exist.
+\texttt{Pairwise} implements generation and prioritisation of the configurations.
+
+\paragraph{Generation.} The algorithm first creates the list of all required
+pairs. It then builds configurations one at a time, each starting from the value
+that occurs in the most uncovered pairs (the \emph{main} value $A$). To fill the
+remaining kinds, it tries the following steps in order~\cite[pp.~25--26]{Urban2024thesis}:
+%
+\begin{enumerate}
+  \item find values $B$ and $C$ such that the pairs $(A,B)$, $(B,C)$ and $(A,C)$
+        are all uncovered (\texttt{add\_triplet});
+  \item find values $B$ and $C$ under the weaker condition that $(A,B)$ and
+        either $(B,C)$ or $(A,C)$ are uncovered (\texttt{add\_transitive\_triplet});
+  \item find any triplet $B$, $C$, $D$ whose three pairs are uncovered
+        (\texttt{add\_any\_triplet});
+  \item find a single value $B$ such that $(A,B)$ is uncovered.
+\end{enumerate}
+%
+Once every kind has a value, the configuration is added to the matrix, its pairs
+are marked as covered, and the next configuration is started. Generation of the
+pairwise matrix ends when no uncovered pair remains.
+
+\paragraph{Prioritisation.} To satisfy the weights, the tool continues to
+generate configurations beyond those needed for pairwise coverage. For each
+value it compares the current frequency $P$ with the frequency $Q$ that the
+weights require, using the \gls{KL} divergence
+%
+\begin{equation}
+  \label{eq:kl}
+  D_{\mathrm{KL}}(P \parallel Q) \;=\; \sum_{x} P(x) \log \frac{P(x)}{Q(x)},
+\end{equation}
+%
+and the value farthest from its required frequency is used
+next~\cite[pp.~20--21, 26--28]{Urban2024thesis}. A weight of zero marks a value that
+is used only during the basic pairwise generation. Such a value is not
+considered during prioritisation, and no divergence is computed for it. If a
+newly built configuration duplicates an existing one, the tool first tries to
+alter it by substituting a single value (\texttt{alter\_configuration}). If that
+fails, it searches all configurations containing the main value for an unused
+one (\texttt{create\_configuration}). When even that fails, the tool stops and
+reports that no further unique configuration meeting the requirements can be
+generated~\cite[p.~28]{Urban2024thesis}.
+
+\paragraph{Shortcomings found by the tests.} The tests described in
+Section~\ref{sec:test-suite-improvements} revealed that the implementation
+differs from this description in two respects. First, step~3 of the
+generation never adds any value. \texttt{add\_any\_triplet} calls
+\texttt{add\_triplet} with exactly the same arguments as step~1, immediately
+after that call has failed, and nothing in between changes the configuration,
+so the call cannot succeed. In effect, only steps 1, 2 and 4 are performed.
+Similarly, the fallback branch after the loop that selects the main value is
+unreachable, and it contains a leftover debugging \texttt{print}. Second, an
+input with a single kind has no pairs to cover, and the tool fails on it with an
+unhandled \texttt{KeyError} instead of producing configurations or rejecting
+the input.
+
+% TODO: what else is missing in the existing solution
 \section{}
 TODO start
 1. Weights do not work. Prioritization of specific configuration should be improved.
@@ -156,9 +271,9 @@ TODO start
 TODO end
 \section{Refactoring tests}
 \label{sec:test-suite-improvements}
-The \emph{Pairwise} tool generates a set of test configurations from a
-specification of parameter \emph{kinds}, each associated with a finite domain of
-values, optionally weighted to bias the relative frequency of individual values.
+The generator described in Section~\ref{sec:existing-solution} produces a set
+of test configurations from a specification of parameter \emph{kinds}, each
+associated with a finite domain of values, optionally weighted to bias the relative frequency of individual values.
 Its purpose is combinatorial: rather than enumerating the full Cartesian product
 of all parameter domains---which grows multiplicatively and quickly becomes
 intractable---the tool emits a far smaller family of configurations that still
@@ -297,8 +412,8 @@ avoid wherever the contract permits.
 
 The central contribution of this work is to test the generator against its
 \emph{specification}---Property~\eqref{eq:coverage}---rather than against a
-single memorised output. The original \texttt{test\_pairwise.py} contained two
-tests, both of which ran the smallest possible input (three kinds of two values
+single memorised output. The original \texttt{test\_pairwise.py}, inherited from Urban's
+implementation~\cite{Urban2024thesis}, contained two tests, both of which ran the smallest possible input (three kinds of two values
 each) and asserted an exact, hard-coded output string. Such \emph{golden-output}
 tests have two complementary failure modes. They are simultaneously too strict,
 in that any change to the ordering or formatting of the output breaks them even
@@ -398,7 +513,8 @@ The property tests of Section~\ref{sec:tsi-property} use only unweighted
 specifications, yet weights are a principal feature of the tool. A weight $w(v)$
 asks the generator to include value $v$ more often relative to the other values
 of its kind; a weight of zero marks $v$ as needed only for pairwise coverage, so
-that it should not be added once its pairs are covered. Weights may therefore
+that it should not be added once its pairs are covered
+(Section~\ref{sec:existing-solution} and~\cite[p.~26]{Urban2024thesis}). Weights may therefore
 cause additional configurations to be emitted, but they must never weaken
 Property~\eqref{eq:coverage}. The unweighted tests were kept unchanged in
 \texttt{test\_pairwise.py}, which is reserved for unweighted generation. The
@@ -425,10 +541,13 @@ affects only the frequencies, never the coverage obligation.
 \paragraph{Frequencies within the margin.} The existing weight test asserted
 hard-coded usage counts, which, like golden output, are brittle and specific to a
 single input. The new test \texttt{test\_weights\_within\_margin} instead checks
-the guarantee that the \texttt{-{}-margin} option expresses. For each value $v$
+the guarantee that the \texttt{-{}-margin} option expresses: as defined by
+Urban~\cite[p.~24]{Urban2024thesis}, no value's \gls{KL} divergence from its
+required ratio may exceed the margin. For each value $v$
 of kind $K$, let $q(v)$ be the share of configurations in which $v$ occupies
 kind $K$, and let $r(v) = w(v) / \sum_{u \in D(K)} w(u)$ be the share its weight
-requests, where an unweighted value counts as $w = 1$. The test asserts
+requests, where an unweighted value counts as $w = 1$. Each term of the
+divergence~\eqref{eq:kl} is checked separately, as in the implementation. The test asserts
 %
 \begin{equation}
   \label{eq:margin}
@@ -439,8 +558,8 @@ requests, where an unweighted value counts as $w = 1$. The test asserts
 where $m$ is the margin, for $m \in \{0.05, 0.2\}$ on two weighted
 specifications. As with \texttt{expected\_pairs}, the divergence is computed
 from the emitted configurations alone, independently of the generator's
-internal bookkeeping. Zero weights are excluded from this test because the
-generator does not use them as frequency targets.
+internal bookkeeping. Zero weights are excluded from this test because no
+divergence is computed for them~\cite[p.~26]{Urban2024thesis}.
 
 \paragraph{A defect exposed by a single-kind input.} A specification with only
 one kind, such as \texttt{\{"P1": ["a", "b"]\}}, has no required pairs. The
