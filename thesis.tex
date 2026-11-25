@@ -256,7 +256,8 @@ Similarly, the fallback branch after the loop that selects the main value is
 unreachable, and it contains a leftover debugging \texttt{print}. Second, an
 input with a single kind has no pairs to cover, and the tool fails on it with an
 unhandled \texttt{KeyError} instead of producing configurations or rejecting
-the input.
+the input. This defect has since been resolved by input validation, as described
+in Section~\ref{sec:tsi-weights}.
 
 % TODO: what else is missing in the existing solution
 \section{}
@@ -562,14 +563,18 @@ internal bookkeeping. Zero weights are excluded from this test because no
 divergence is computed for them~\cite[p.~26]{Urban2024thesis}.
 
 \paragraph{A defect exposed by a single-kind input.} A specification with only
-one kind, such as \texttt{\{"P1": ["a", "b"]\}}, has no required pairs. The
-generator then selects the first configuration's starting value from usage
-counts that are still empty, and fails with a \texttt{KeyError}. The test
-\texttt{test\_single\_kind} records the expected behaviour, one configuration per
-value, and is marked as a strict expected failure. It therefore fails loudly
-once the defect is repaired, prompting removal of the marker. Whether such
-input should instead be rejected during parameter validation is left as a
-design decision.
+one kind, such as \texttt{\{"P1": ["a", "b"]\}}, has no required pairs, since
+Equation~\eqref{eq:required-pairs} ranges over pairs of distinct kinds. The
+original generator nevertheless proceeded to build configurations, selected the
+starting value of the first one from usage counts that were still empty, and
+failed with an unhandled \texttt{KeyError}. The test initially recorded this as
+a strict expected failure. Rather than extending the generation algorithm to a
+case in which pairwise testing is not meaningful, the defect was resolved by
+extending the input validation: \texttt{ParametersCheck} now rejects any
+specification with fewer than two kinds, reporting the reason to the user, before
+generation starts. The test was accordingly renamed to
+\texttt{test\_insufficient\_kinds\_rejected} and asserts this rejection for
+specifications with zero and with one kind.
 
 \subsection{Results}
 \label{sec:tsi-results}
@@ -580,7 +585,9 @@ summarised in Table~\ref{tab:coverage}. Considered in isolation,
 Section~\ref{sec:tsi-property}, the increase being attributable to the
 triplet-construction paths now reached by the asymmetric and higher-arity
 inputs. The three additional unweighted input shapes, described at the end of
-Section~\ref{sec:tsi-property}, raised it to $80\%$. The weight-aware selection and fallback routines that
+Section~\ref{sec:tsi-property}, raised it to $80\%$; after single-kind input
+began to be rejected during validation (Section~\ref{sec:tsi-weights}), that
+input no longer reaches the generator, and the figure settled at $79\%$. The weight-aware selection and fallback routines that
 account for most of the remainder are exercised by \texttt{test\_weights.py},
 which on its own covers $95\%$ of the module both before and after the weighted
 tests were added to it. When the entire suite is measured together---the
@@ -589,8 +596,8 @@ coverage of the generator module is $97\%$ (311 of 321 statements), again both
 before and after the additions of Section~\ref{sec:tsi-weights}. The weighted
 tests reach no new statements, because the existing weight tests already
 executed the same routines; their value lies in the properties they assert, not
-in the statements they execute. The full suite comprises twenty-seven passing tests and one expected
-failure, and runs in about $0.1$~s. The original subprocess-based suite took
+in the statements they execute. The full suite comprises twenty-nine passing tests, with no expected
+failures, and runs in about $0.1$~s. The original subprocess-based suite took
 $2.68$~s, and the migrated suite took $0.04$~s before the tests of
 Section~\ref{sec:tsi-weights} were added. The speed-up is a direct consequence
 of the move to in-process invocation described in Section~\ref{sec:tsi-clirunner}.
@@ -601,7 +608,7 @@ of the move to in-process invocation described in Section~\ref{sec:tsi-clirunner
     \hline
     Measurement scope & Original & Property tests & Weighted and edge cases \\
     \hline
-    \texttt{test\_pairwise.py} only & $66\%$ & $79\%$ & $80\%$ \\
+    \texttt{test\_pairwise.py} only & $66\%$ & $79\%$ & $79\%$ \\
     \texttt{test\_weights.py} only  & ---    & $95\%$ & $95\%$ \\
     Whole suite                     & ---    & $97\%$ & $97\%$ \\
     \hline
@@ -663,8 +670,8 @@ now tested against the formal pairwise-coverage property of
 Equation~\eqref{eq:coverage} across deliberately varied inputs, with and without
 weights, with the frequencies checked against the requested margin, and with the
 \gls{CSV} export validated for structural conformance. The edge-case inputs exposed a
-defect in the handling of single-kind specifications, now recorded as an
-expected failure. Statement coverage of the generator module reached $97\%$ for
+defect in the handling of single-kind specifications, which was resolved by
+rejecting such input during parameter validation. Statement coverage of the generator module reached $97\%$ for
 the complete suite, and, more
 significantly than any
 single figure, the suite now asserts \emph{what the program is meant to compute}
