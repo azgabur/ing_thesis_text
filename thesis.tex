@@ -438,7 +438,10 @@ literal; it is recovered with \texttt{ast.literal\_eval} rather than the unsafe
 round-trip to their original types. The second, \texttt{expected\_pairs},
 computes the required-pair set $P$ of Equation~\eqref{eq:required-pairs} directly
 from the specification. The third, \texttt{covered\_pairs}, computes the pairs
-actually realised by the generated configurations. The coverage obligation
+actually realised by the generated configurations. Following the changes
+described in Section~\ref{sec:formats}, \texttt{parse\_configurations} parses
+the \gls{JSON} output instead, and all values used in the tests are strings.
+The coverage obligation
 \eqref{eq:coverage} is then checked by the set containment
 %
 \begin{equation}
@@ -508,7 +511,9 @@ standard output. The export is thereby validated for both its schema and its
 cardinality, elevating the check from mere existence to content conformance. As a
 secondary benefit, the test writes into a per-test temporary directory supplied
 by the framework's \texttt{tmp\_path} fixture, restoring the hermeticity goal of
-Section~\ref{sec:tsi-tempfile} to this case as well.
+Section~\ref{sec:tsi-tempfile} to this case as well. This test was later
+superseded when the file export was replaced by output on standard output, as
+described in Section~\ref{sec:formats}.
 
 \subsection{Weighted Generation and Edge Cases}
 \label{sec:tsi-weights}
@@ -752,7 +757,7 @@ LABEL name="pairwise" \
       summary="Pairwise test configuration generator" \
       org.opencontainers.image.source="https://github.com/azgabur/Pairwise"
 
-RUN pip install --no-cache-dir click
+RUN pip install --no-cache-dir click pyyaml
 
 COPY main/ /opt/app-root/src/main/
 
@@ -760,7 +765,8 @@ ENTRYPOINT ["python3", "/opt/app-root/src/main/main.py"]
 CMD ["--help"]
 \end{lstlisting}
 %
-Only the runtime dependency, \texttt{click}, is installed. The
+Only the runtime dependencies, \texttt{click} and \texttt{pyyaml}
+(Section~\ref{sec:formats}), are installed. The
 \texttt{[packages]} section of the \texttt{Pipfile} also contains
 \texttt{pytest}, but the tool does not need it at run time, so it is left out
 along with the development tools. The \texttt{-{}-no-cache-dir} option keeps the
@@ -780,11 +786,17 @@ podman run --rm -v "$PWD":/data:Z \
   quay.io/rhn_support_azgabur/pairwise /data/parameters.json
 \end{lstlisting}
 %
-Because the process inside the container runs as \gls{UID}~1001, writing a
-\gls{CSV} file into a mounted host directory with rootless Podman requires the
-host user to be mapped to that \gls{UID}, for example with
-\texttt{-{}-userns=keep-id:uid=1001,gid=0}. This usage is documented in the
-\texttt{README} of the repository.
+Since the generated configurations are written to standard output
+(Section~\ref{sec:formats}), they are saved by redirecting the output on the
+host. No file is written inside the container, so the \gls{UID}~1001 under
+which the process runs does not have to be mapped to the host user. The
+specification can also be supplied through standard input, in which case no
+directory needs to be mounted at all:
+%
+\begin{lstlisting}[caption={Running the generator with standard input and output.},label={lst:container-stdio}]
+podman run --rm -i quay.io/rhn_support_azgabur/pairwise \
+  -o yaml - < parameters.yaml > configurations.yaml
+\end{lstlisting}
 
 \subsection{Automated build and publication}
 \label{sec:container-ci}
@@ -811,6 +823,198 @@ stored as the repository secrets \texttt{QUAY\_USERNAME} and
 the \texttt{latest} tag always points to the state of the \texttt{master}
 branch, the pipeline in Chapter~\ref{ch:test-automation} can reference the
 image by this tag and thereby always uses the current version of the generator.
+
+\section{Input and output formats}
+\label{sec:formats}
+
+\subsection{Motivation}
+The original tool accepted the specification of parameters exclusively as a
+\gls{JSON} document and offered two kinds of output: a human-readable listing of
+the configurations printed to standard output, and an optional \gls{CSV} file
+written to the path given by \texttt{-{}-output}
+(Section~\ref{sec:existing-solution}). Both properties are limiting in the
+context of the Kuadrant project. The configuration of Kuadrant and of the
+surrounding Kubernetes and Tekton ecosystem is written almost exclusively in
+\gls{YAML}, so a specification of the supported matrix in the same format is
+more natural for its maintainers to write and review. Unlike \gls{JSON},
+\gls{YAML} also permits comments, which can document why a particular value is
+part of the matrix. On the output side, the listing is intended for a human
+reader and cannot be reliably processed by another program, while the \gls{CSV}
+file has to be written to and read from the file system by the tool and its
+consumer. The pipeline described in Chapter~\ref{ch:test-automation} requires an
+output that a subsequent step can consume directly, preferably in a structured
+format.
+
+\subsection{Reading the specification}
+The loading of the input was moved from \texttt{ParametersCheck} into a new
+module, \texttt{file\_formats}, which is responsible for all serialisation and
+deserialisation in the tool. \gls{YAML} documents are parsed with the PyYAML
+library~\cite{pyyaml} using its \texttt{safe\_load} function, which constructs
+only standard Python types and, unlike the full loader, never instantiates
+arbitrary objects named in the document. The specification keeps the same
+structure as in \gls{JSON}, with the mandatory \texttt{Parameters} and the
+optional \texttt{Weights} mappings, as shown in Listing~\ref{lst:yaml-input}.
+%
+\begin{lstlisting}[caption={Specification of parameters in YAML.},label={lst:yaml-input}]
+Parameters:
+  OCP: ["4.20", "4.21", rosa]   # versions quoted to remain strings
+  istioProvider: [ossm3, ocp]
+  redisDb: [redis, valkey, dragonfly]
+Weights:
+  ossm3: 2
+\end{lstlisting}
+%
+The format is selected by the new option \texttt{-{}-input-format}
+(\texttt{-i}), which accepts the values \texttt{json} and \texttt{yaml}. When
+the option is omitted, the format is derived from the file extension
+(\texttt{.json}, \texttt{.yaml} or \texttt{.yml}). If the extension is not
+recognised, which is also the case when the specification is read from standard
+input by passing \texttt{-} in place of the file name, the content is first
+parsed as \gls{JSON} and, should that fail, as \gls{YAML}. Although \gls{YAML}~1.2
+is designed as a superset of \gls{JSON}~\cite{yaml-spec}, the \gls{JSON} parser
+is attempted first, because PyYAML implements \gls{YAML}~1.1 and does not accept
+every valid \gls{JSON} document. For instance, the \gls{JSON} specification of
+the Kuadrant matrix, which is indented with tab characters, is rejected by
+PyYAML. If neither parser succeeds, the tool reports the errors of all attempted
+formats.
+
+\subsection{Structural validation}
+\label{sec:formats-validation}
+The original checker assumed a well-formed document and accessed its keys
+directly: a missing \texttt{Parameters} key terminated the tool with an
+unhandled \texttt{KeyError}, a misspelt optional key such as \texttt{Weight} was
+silently ignored, and no constraint was placed on the type of the values. The
+specification was therefore given an explicit schema, which
+\texttt{ParametersCheck} enforces before the existing semantic checks:
+%
+\begin{itemize}
+  \item the document is a mapping whose only permitted keys are the mandatory
+        \texttt{Parameters} and the optional \texttt{Weights};
+  \item \texttt{Parameters} maps every kind, identified by a string, to a list
+        of values, and every value is a string;
+  \item \texttt{Weights}, if present and non-empty, maps values, given as
+        strings, to numbers.
+\end{itemize}
+%
+Violations are reported by the new exception \texttt{InvalidStructure}, or by
+the existing \texttt{InvalidWeight} in the case of a weight that is not a number.
+An empty \texttt{Weights} key, which \gls{YAML} reads as null, is treated as the
+absence of weights.
+
+The restriction of values to strings reflects their role in the generator. A
+value is merely a label identifying an element of the domain of a kind
+(Section~\ref{sec:pairwise-theory}) and carries no numerical or logical meaning:
+the generator only compares values for equality, and the numerical information
+that influences generation is carried exclusively by the weights. Admitting
+other types, by contrast, led to subtle errors. Python considers \texttt{True}
+equal to \texttt{1}, so a boolean value and an integer value in different kinds
+were reported as duplicates, and a null value collides with \texttt{None}, which
+the generator uses internally to mark a kind that has not yet been filled in a
+configuration. The restriction is particularly important for \gls{YAML}, which
+resolves the type of an unquoted scalar implicitly: \texttt{1} and \texttt{4.20}
+are read as numbers, the latter losing its trailing zero and becoming $4.2$,
+\texttt{true} as a boolean, \texttt{2024-01-01} as a date, and
+\texttt{\textasciitilde} as null. Without the restriction, the OpenShift version
+\texttt{4.20} in the Kuadrant matrix would silently become \texttt{4.2}; with
+it, such values are rejected with a hint that they should be quoted. The
+restriction is consistent with Urban's thesis, whose examples write all values,
+including numeric-looking ones such as OpenShift versions, as \gls{JSON}
+strings~\cite[pp.~24, 31]{Urban2024thesis}.
+
+\subsection{Output on standard output}
+The output was redesigned so that the tool writes the generated configurations
+exclusively to standard output, and the option \texttt{-{}-output} (\texttt{-o})
+now selects their format rather than a destination file. Three formats are
+supported:
+%
+\begin{description}
+  \item[\texttt{csv}] (the default) a header row with the names of the kinds,
+        followed by one row per configuration, i.e.\ the content of the former
+        \gls{CSV} file;
+  \item[\texttt{json}, \texttt{yaml}] a mapping with the single key
+        \texttt{Configurations}, whose value is the list of configurations, each
+        represented as a mapping from kind to value
+        (Listing~\ref{lst:yaml-output}).
+\end{description}
+%
+\begin{lstlisting}[caption={Generated configurations in the YAML output format (abridged).},label={lst:yaml-output}]
+Configurations:
+- OCP: '4.20'
+  istioProvider: ocp
+  redisDb: redis
+- OCP: rosa
+  istioProvider: ossm3
+  redisDb: valkey
+\end{lstlisting}
+%
+Since all values are strings, the serialiser quotes those that would otherwise
+be read back as a different type, such as \texttt{'4.20'} in
+Listing~\ref{lst:yaml-output}, so the output can be parsed again without loss of
+information. A top-level mapping was preferred to a bare list because it leaves
+room for additional metadata without breaking existing consumers.
+
+Writing to standard output follows the convention of composable command-line
+tools. The user or a pipeline step may redirect the output into a file, pipe it
+into another program or capture it as a step result, and the tool itself no
+longer needs to manage files. To keep standard output machine-readable, all
+auxiliary information is written to standard error. The warning issued when no
+further unique configuration can be generated already used the
+\texttt{warnings} module, and the statistics printed by \texttt{-{}-count} were
+redirected to standard error as well. For the same reason, the leftover
+debugging \texttt{print} mentioned in Section~\ref{sec:existing-solution} was
+removed, since it would have corrupted the output had it ever been reached. The
+numbered human-readable listing was dropped, as the default \gls{CSV} output
+serves the same purpose for a human reader. The export method \texttt{to\_csv}
+was moved from the class \texttt{Pairwise} into \texttt{file\_formats} together
+with the new serialisers, so that \texttt{Pairwise} is concerned solely with
+generation. A \gls{YAML} matrix is thus produced, for example, by the command
+in Listing~\ref{lst:yaml-run}.
+%
+\begin{lstlisting}[caption={Generating configurations in YAML.},label={lst:yaml-run}]
+pipenv run pairwise -o yaml parameters.yaml > configurations.yaml
+\end{lstlisting}
+
+\subsection{Compatibility}
+The changes described in this section intentionally break the backward
+compatibility of the interface in three respects:
+%
+\begin{enumerate}
+  \item parameter values must be strings, so specifications containing numeric
+        or boolean values, such as \texttt{"P2": [1, 2]} used in the original
+        \texttt{README} and tests, must quote them as
+        \texttt{"P2": ["1", "2"]};
+  \item the option \texttt{-{}-output} selects the format of the output instead
+        of a destination file, so \texttt{-{}-output file.csv} becomes
+        \texttt{-{}-output csv > file.csv};
+  \item the numbered listing on standard output was replaced by the \gls{CSV}
+        output, and the statistics of \texttt{-{}-count} were moved to standard
+        error.
+\end{enumerate}
+%
+These breaks were preferred over compatibility modes, because they make the
+interface unambiguous for automated use. Specifications that follow the
+examples in Urban's thesis, as well as the specification of the Kuadrant
+matrix, already use only string values and are unaffected by the first change.
+
+\subsection{Tests}
+The new functionality is covered by a dedicated test module,
+\texttt{test\_formats.py}, comprising 34 test cases. They verify that equivalent
+\gls{JSON} and \gls{YAML} specifications, including those read from standard
+input and from files with an unrecognised extension, yield identical
+configurations; that an explicit \texttt{-{}-input-format} takes precedence
+over the extension; that unparseable files and each class of structurally
+invalid input, including values of any type other than a string, are rejected
+with the corresponding exception; and that every output format can be parsed
+back into the expected configurations. The existing tests were adapted to the
+new interface, and the numeric values they used were converted to strings. The
+helper \texttt{parse\_configurations} now reads the \gls{JSON} output instead of
+parsing the textual listing, which removes the need for
+\texttt{ast.literal\_eval}. The test of \texttt{-{}-count} asserts that the
+statistics appear on standard error and not on standard output, and the legacy
+golden-output test now compares the default \gls{CSV} output. The test of the
+\gls{CSV} file described in Section~\ref{sec:tsi-csv} was replaced by an
+equivalent check of the \gls{CSV} output. The complete suite comprises 62
+passing tests.
 
 \chapter{Test automation}
 \label{ch:test-automation}
